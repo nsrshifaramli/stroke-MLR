@@ -19,7 +19,8 @@ MLR/
 ├── data/                     # raw data (read-only)
 │   └── stroke-fatality-cooked2.dta
 ├── analysis/                 # Quarto/R source code
-│   └── stroke_rreaapp.qmd
+│   ├── stroke_rreaapp.qmd
+│   └── stroke_rreaapp.R      # plain R version (regenerate with knitr::purl after editing the .qmd)
 ├── reports/                  # rendered outputs (HTML)
 │   └── stroke_rreaapp.html
 └── practice/                 # earlier practice files (chapter model with interaction)

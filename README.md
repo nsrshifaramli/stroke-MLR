@@ -33,7 +33,8 @@ Based on *Logistic Regression Analysis in Health and Medicine* by Kamarul Imran 
 ├── summary.md           # one-page summary of methods and results
 ├── data/                # put stroke-fatality-cooked2.dta here (not included)
 ├── analysis/
-│   └── stroke_rreaapp.qmd   # main analysis (Quarto)
+│   ├── stroke_rreaapp.qmd   # main analysis (Quarto)
+│   └── stroke_rreaapp.R     # same code as a plain R script
 ├── index.html           # GitHub Pages landing page
 ├── reports/
 │   └── stroke_rreaapp.html  # rendered report
