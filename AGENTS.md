@@ -15,6 +15,7 @@ Rules for any AI agent (or human) working in this folder.
 MLR/
 ├── AGENTS.md                 # this file: rules
 ├── implementation.md         # RREAAPP plan
+├── index.html                # GitHub Pages landing page (https://nsrshifaramli.github.io/stroke-MLR/)
 ├── data/                     # raw data (read-only)
 │   └── stroke-fatality-cooked2.dta
 ├── analysis/                 # Quarto/R source code
@@ -80,5 +81,6 @@ Do not skip a step or merge steps. Each step is its own section in the report.
 ## Before finishing any task
 
 - Render the report, move the HTML to `reports/`, and confirm it builds without errors.
+- The repository is **public** and GitHub Pages serves `main` from the root. Never commit the `.dta` data file.
 - Check that the outcome count is 62 dead / 164 alive (n = 226).
 - Do not run the analysis unless the user has approved the plan in `implementation.md`.

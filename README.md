@@ -4,6 +4,8 @@ A binary logistic regression analysis in R of in-hospital death after acute stro
 
 **R**eason → **R**ead → **E**xplore → **A**ssume → **A**pply → **A**ssess → **P**resent → **P**ublish
 
+**Online report:** <https://nsrshifaramli.github.io/stroke-MLR/>
+
 Based on *Logistic Regression Analysis in Health and Medicine* by Kamarul Imran Musa (2026):
 <https://drkamarul.github.io/logistic_regression_2026/logistic-regression-chapter.html>
 
@@ -31,8 +33,8 @@ Based on *Logistic Regression Analysis in Health and Medicine* by Kamarul Imran 
 ├── data/                # put stroke-fatality-cooked2.dta here (not included)
 ├── analysis/
 │   └── stroke_rreaapp.qmd   # main analysis (Quarto)
+├── index.html           # GitHub Pages landing page
 ├── reports/
-│   ├── index.html           # GitHub Pages landing page
 │   └── stroke_rreaapp.html  # rendered report
 └── practice/            # earlier practice files (chapter model with interaction)
 ```
