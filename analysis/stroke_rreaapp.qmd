@@ -1,0 +1,757 @@
+---
+title: "Stroke Fatality at Discharge: Binary Logistic Regression"
+subtitle: "RREAAPP workflow: Reason · Read · Explore · Assume · Apply · Assess · Present · Publish"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    embed-resources: true
+    fig-width: 9
+    fig-height: 5
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+invisible(Sys.setlocale("LC_ALL", "en_US.UTF-8"))
+library(haven)
+library(tidyverse)
+library(gtsummary)
+library(broom)
+library(ResourceSelection)
+library(pROC)
+library(car)
+set.seed(2026)
+theme_set(theme_minimal(base_size = 12))
+theme_gtsummary_compact()
+```
+
+::: {.callout-note}
+**Teaching dataset.** `stroke-fatality-cooked2.dta` was modified by its author so that the patterns being taught show clearly. The results below illustrate method. They are not evidence about stroke care.
+:::
+
+# Reason
+
+- **Research question:** which admission characteristics are associated with death before discharge among patients admitted with acute stroke?
+- **Outcome:** `outcome`, status at discharge (alive = 0, **dead = 1**). The models estimate the **odds of death**.
+- **Candidate predictors:** demographics (sex, age, ethnicity, marital status), earliest vital signs (GCS, SBP, DBP, heart rate), admission blood results (haemoglobin, platelets, WBC, sodium, potassium, blood sugar, urea), comorbidities (hypertension, diabetes, dyslipidaemia), referral source and stroke type.
+- **Purpose:** to estimate adjusted associations (odds ratios), not to build a prediction tool. **GCS is a mediator** (stroke type → depressed consciousness → death), so it is examined in the univariable step but **left out of the multivariable model**.
+- **Model:** binary logistic regression, main effects only (no interactions).
+
+# Read
+
+## Import with `haven`
+
+```{r}
+#| label: read-import
+raw <- read_dta("../data/stroke-fatality-cooked2.dta")
+dim(raw)
+```
+
+```{r}
+#| label: read-labels
+tibble(variable = names(raw),
+       label    = map_chr(raw, ~ attr(.x, "label") %||% ""),
+       class    = map_chr(raw, ~ class(.x)[1]))
+```
+
+## Fix variable names and codes
+
+The names are renamed to descriptive snake_case, the labelled Stata variables are converted to factors, and reference categories are set. The raw file is never changed.
+
+```{r}
+#| label: read-clean
+stroke <- raw %>%
+  zap_label() %>%
+  rename(id = rn, heart_rate = hr, haemoglobin = hb, platelet = plat,
+         sodium = na, potassium = potas, blood_sugar = cbs,
+         married = maritalstat, referral = referralcase,
+         stroke_type = stroketype) %>%
+  mutate(across(where(is.labelled), as_factor)) %>%
+  mutate(
+    outcome     = fct_relevel(outcome, "alive"),
+    sex         = fct_relevel(sex, "male"),
+    stroke_type = fct_recode(stroke_type,
+                             Ischaemic    = "CI (Ischaemic Stroke)",
+                             Haemorrhagic = "Haemorrhagic Stroke") %>%
+                  fct_relevel("Ischaemic"),
+    referral    = fct_recode(referral, Hospital = "hospital",
+                             `GP/Home` = "GP/Home/Missing") %>%
+                  fct_relevel("Hospital"),
+    across(c(hypertension, married, malay, diabetes, dyslipidaemia),
+           ~ fct_relevel(.x, "no")),
+    dead        = as.integer(outcome == "dead")      # numeric 0/1 copy
+  ) %>%
+  mutate(across(where(is.factor), fct_drop))
+
+# variable labels for tables
+var_labels <- list(
+  sex = "Sex", age = "Age (years)", malay = "Malay ethnicity",
+  married = "Married", gcs = "Glasgow Coma Scale", sbp = "Systolic BP (mmHg)",
+  dbp = "Diastolic BP (mmHg)", heart_rate = "Heart rate (bpm)",
+  haemoglobin = "Haemoglobin (g/dL)", platelet = "Platelet (×10⁹/L)",
+  wbc = "White cell count (×10⁹/L)", sodium = "Sodium (mmol/L)",
+  potassium = "Potassium (mmol/L)", blood_sugar = "Capillary blood sugar (mmol/L)",
+  urea = "Urea (mmol/L)", hypertension = "Hypertension", diabetes = "Diabetes",
+  dyslipidaemia = "Dyslipidaemia", referral = "Referral source",
+  stroke_type = "Stroke type", outcome = "Outcome at discharge")
+
+glimpse(stroke)
+count(stroke, outcome) %>% mutate(percent = round(100 * n / sum(n), 1))
+```
+
+```{r}
+#| label: read-groups
+num_vars <- c("age", "gcs", "sbp", "dbp", "heart_rate", "haemoglobin", "platelet",
+              "wbc", "sodium", "potassium", "blood_sugar", "urea")
+cat_vars <- c("sex", "malay", "married", "hypertension", "diabetes",
+              "dyslipidaemia", "referral", "stroke_type")
+```
+
+**Result.** `r nrow(stroke)` patients and `r ncol(raw)` variables: `r length(num_vars)` numeric, `r length(cat_vars)` categorical predictors, the outcome and an ID. `r sum(stroke$dead)` patients (`r round(100*mean(stroke$dead),1)`%) died before discharge.
+
+# Explore
+
+## Missing data
+
+```{r}
+#| label: explore-missing
+stroke %>%
+  summarise(across(everything(), ~ sum(is.na(.x)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  arrange(desc(n_missing))
+```
+
+**Result.** `r sum(is.na(stroke))` missing values in total. **The dataset is complete.**
+
+## Possible errors in the data
+
+Each numeric variable is checked against a plausible clinical range. The checks also cover duplicate IDs, DBP ≥ SBP, non-integer GCS and empty factor levels.
+
+```{r}
+#| label: explore-errors
+ranges <- tribble(
+  ~variable,     ~lower, ~upper,
+  "age",             18,    110,
+  "gcs",              3,     15,
+  "sbp",             60,    300,
+  "dbp",             30,    200,
+  "heart_rate",      30,    220,
+  "haemoglobin",      4,     22,
+  "platelet",        10,   1000,
+  "wbc",              1,     50,
+  "sodium",         110,    170,
+  "potassium",        2,      8,
+  "blood_sugar",      1,     40,
+  "urea",             1,     60)
+
+range_check <- stroke %>%
+  select(id, all_of(num_vars)) %>%
+  pivot_longer(-id, names_to = "variable") %>%
+  left_join(ranges, by = "variable") %>%
+  filter(value < lower | value > upper)
+range_check
+
+tibble(
+  check  = c("Duplicate IDs", "DBP >= SBP", "Non-integer GCS",
+             "Values outside plausible range"),
+  n_flagged = c(sum(duplicated(stroke$id)), sum(stroke$dbp >= stroke$sbp),
+                sum(stroke$gcs != round(stroke$gcs)), nrow(range_check)))
+
+map(stroke[cat_vars], table)   # check factor levels
+```
+
+**Result.** There are no duplicate IDs, no DBP ≥ SBP and no non-integer GCS. Every factor has only its expected levels; the "Other" stroke type in the Stata label has no patients. `r nrow(range_check)` value(s) fall outside the plausible ranges and are listed above. These are flagged for checking against the source records. **They are kept in the analysis, as agreed.**
+
+## Outliers (IQR rule)
+
+```{r}
+#| label: explore-outliers
+outliers <- stroke %>%
+  select(id, all_of(num_vars)) %>%
+  pivot_longer(-id, names_to = "variable") %>%
+  group_by(variable) %>%
+  mutate(q1 = quantile(value, 0.25), q3 = quantile(value, 0.75),
+         iqr = q3 - q1,
+         outlier = value < q1 - 1.5 * iqr | value > q3 + 1.5 * iqr) %>%
+  ungroup()
+
+outliers %>% group_by(variable) %>%
+  summarise(min = min(value), q1 = first(q1), median = median(value),
+            q3 = first(q3), max = max(value), n_outliers = sum(outlier)) %>%
+  arrange(desc(n_outliers))
+
+outliers %>% filter(outlier) %>% select(id, variable, value) %>%
+  arrange(variable, value) %>% print(n = Inf)
+```
+
+**Result.** `r sum(outliers$outlier)` values in `r n_distinct(outliers$id[outliers$outlier])` patients fall outside 1.5 × IQR. Sodium and urea have the most. Most of these are clinically plausible extremes for acutely ill stroke patients, such as hyponatraemia or raised urea, rather than errors. **No records are removed.**
+
+## Numeric variables: histograms and boxplots
+
+```{r}
+#| label: explore-hist
+#| fig-height: 7
+stroke_long <- stroke %>%
+  select(outcome, all_of(num_vars)) %>%
+  pivot_longer(-outcome, names_to = "variable")
+
+ggplot(stroke_long, aes(value)) +
+  geom_histogram(bins = 20, fill = "steelblue", colour = "white") +
+  facet_wrap(~ variable, scales = "free", ncol = 4) +
+  labs(title = "Histograms of numeric variables", x = NULL, y = "Count")
+```
+
+```{r}
+#| label: explore-box
+#| fig-height: 7
+ggplot(stroke_long, aes(x = "", y = value)) +
+  geom_boxplot(fill = "lightblue", outlier.colour = "red") +
+  facet_wrap(~ variable, scales = "free", ncol = 4) +
+  labs(title = "Boxplots of numeric variables (red = IQR outliers)", x = NULL, y = NULL)
+```
+
+```{r}
+#| label: explore-box-outcome
+#| fig-height: 7
+ggplot(stroke_long, aes(outcome, value, fill = outcome)) +
+  geom_boxplot(outlier.size = 0.8) +
+  facet_wrap(~ variable, scales = "free_y", ncol = 4) +
+  scale_fill_manual(values = c(alive = "#4C9F70", dead = "#C0504D")) +
+  labs(title = "Numeric variables by outcome", x = NULL, y = NULL) +
+  theme(legend.position = "none")
+```
+
+**Interpretation.** GCS is strongly left-skewed: most patients score 15. Urea, blood sugar and WBC are right-skewed. Deaths have visibly lower GCS and higher WBC.
+
+## Categorical variables: bar charts
+
+```{r}
+#| label: explore-bar
+#| fig-height: 6
+cat_long <- stroke %>%
+  select(outcome, all_of(cat_vars)) %>%
+  pivot_longer(-outcome, names_to = "variable", values_to = "level")
+
+ggplot(cat_long, aes(level)) +
+  geom_bar(fill = "steelblue") +
+  facet_wrap(~ variable, scales = "free", ncol = 4) +
+  labs(title = "Bar charts of categorical variables", x = NULL, y = "Count")
+```
+
+```{r}
+#| label: explore-bar-outcome
+#| fig-height: 6
+ggplot(cat_long, aes(level, fill = outcome)) +
+  geom_bar(position = "fill") +
+  facet_wrap(~ variable, scales = "free_x", ncol = 4) +
+  scale_fill_manual(values = c(alive = "#4C9F70", dead = "#C0504D")) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Proportion who died, by category", x = NULL, y = "Percent")
+```
+
+## Descriptive table (gtsummary)
+
+```{r}
+#| label: tbl-descriptive
+#| tbl-cap: "Table 1. Patient characteristics by outcome at discharge"
+stroke %>%
+  select(-id, -dead) %>%
+  tbl_summary(by = outcome, label = var_labels,
+              statistic = all_continuous() ~ "{median} ({p25}, {p75})") %>%
+  add_overall() %>%
+  add_p() %>%
+  bold_p() %>%
+  modify_spanning_header(all_stat_cols(FALSE) ~ "**Outcome at discharge**")
+```
+
+# Assume
+
+| Assumption | How it is checked |
+|---|---|
+| **Binomial distribution** of the outcome | The outcome is binary (dead/alive), so it is modelled with `family = binomial(link = "logit")` |
+| **Independent observations** | One record per admission; no duplicate IDs (Section 3.2) |
+| **Linear in the logit** for numeric predictors | Empirical logits by quartile and an LRT for an added quadratic term (Section 5.4) |
+| **Model correctly specified** | Purposeful selection, no omitted confounders, Hosmer–Lemeshow test and residual diagnostics (Section 6) |
+| No multicollinearity | Variance inflation factor (VIF) below 5 (Section 5.4) |
+| Enough events | `r sum(stroke$dead)` deaths; about 10 events per parameter allows roughly `r floor(sum(stroke$dead)/10)` parameters |
+
+```{r}
+#| label: assume-binary
+table(stroke$outcome, stroke$dead)   # confirms 0/1 coding of the event
+```
+
+# Apply
+
+## Univariable logistic regression
+
+Each candidate predictor is fitted alone: `glm(outcome ~ x, family = binomial)`. The p-value is from the likelihood ratio test (LRT) against the intercept-only model.
+
+```{r}
+#| label: apply-univariable
+candidates <- c(num_vars, cat_vars)
+m_null <- glm(outcome ~ 1, data = stroke, family = binomial)
+
+uni <- map_dfr(candidates, function(v) {
+  m   <- glm(reformulate(v, "outcome"), data = stroke, family = binomial)
+  lrt <- anova(m_null, m, test = "LRT")
+  tidy(m, conf.int = TRUE) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(variable = v, lrt_chisq = lrt$Deviance[2], lrt_p = lrt$`Pr(>Chi)`[2])
+}) %>%
+  transmute(variable, term,
+            beta = estimate, beta_low = conf.low, beta_high = conf.high,
+            OR = exp(estimate), OR_low = exp(conf.low), OR_high = exp(conf.high),
+            wald_p = p.value, lrt_chisq, lrt_p) %>%
+  arrange(lrt_p)
+
+uni %>% mutate(across(where(is.numeric), ~ signif(.x, 3))) %>% print(n = Inf)
+```
+
+## Identify possible independent variables
+
+Rules from purposeful selection:
+
+1. Carry forward variables with univariable LRT **p < 0.25**.
+2. **Exclude GCS**, a mediator on the causal pathway (see Reason).
+3. **Keep sex and age** as standard demographic adjustments, whatever their p-value.
+
+```{r}
+#| label: apply-select
+screen <- uni %>% distinct(variable, lrt_p) %>%
+  mutate(p_lt_0.25 = lrt_p < 0.25,
+         decision = case_when(
+           variable == "gcs"           ~ "Excluded: mediator",
+           variable %in% c("sex", "age") ~ "Included: demographic adjustment",
+           p_lt_0.25                   ~ "Included: p < 0.25",
+           TRUE                        ~ "Not carried forward"))
+screen %>% mutate(lrt_p = signif(lrt_p, 3)) %>% print(n = Inf)
+
+selected <- screen %>% filter(str_starts(decision, "Included")) %>% pull(variable)
+selected
+```
+
+## Multivariable logistic regression (main effects, no interaction)
+
+**Step 1: full model** with all selected variables.
+
+```{r}
+#| label: apply-full
+m_full <- glm(reformulate(selected, "outcome"), data = stroke, family = binomial)
+tidy(m_full, exponentiate = TRUE, conf.int = TRUE) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+```
+
+**Step 2: backward elimination.** At each step the variable with the largest LRT p-value (> 0.05) is removed. Sex and age are kept as forced adjustments. Before a removal is accepted, the coefficients of the variables that are significant in the current model are checked. If any of them changes by more than 20%, the removed variable is a **confounder** and goes back in.
+
+```{r}
+#| label: apply-backward
+forced <- c("sex", "age")
+m_cur  <- m_full
+log_steps <- list()
+repeat {
+  dr <- drop1(m_cur, test = "LRT") %>% as.data.frame() %>%
+    rownames_to_column("variable") %>% filter(variable != "<none>")
+  cand <- dr %>% filter(!variable %in% c(forced, unlist(map(log_steps, "kept")))) %>%
+    arrange(desc(`Pr(>Chi)`)) %>% slice(1)
+  if (nrow(cand) == 0 || cand$`Pr(>Chi)` < 0.05) break
+  m_try <- update(m_cur, as.formula(paste(". ~ . -", cand$variable)))
+  sig_terms <- tidy(m_cur) %>% filter(term != "(Intercept)", p.value < 0.05) %>% pull(term)
+  sig_terms <- intersect(sig_terms, names(coef(m_try)))
+  pct <- abs((coef(m_try)[sig_terms] - coef(m_cur)[sig_terms]) / coef(m_cur)[sig_terms]) * 100
+  confounder <- length(pct) > 0 && max(pct) > 20
+  log_steps[[length(log_steps) + 1]] <- tibble(
+    step = length(log_steps) + 1, variable = cand$variable,
+    lrt_p = round(cand$`Pr(>Chi)`, 3),
+    max_change_pct = round(if (length(pct)) max(pct) else 0, 1),
+    action = if (confounder) "kept (confounder)" else "removed",
+    kept = if (confounder) cand$variable else NA_character_)
+  if (!confounder) m_cur <- m_try
+}
+bind_rows(log_steps) %>% select(-kept)
+m_prelim <- m_cur
+formula(m_prelim)
+```
+
+**Step 3: add back excluded variables one at a time** to check whether any becomes significant or acts as a confounder.
+
+```{r}
+#| label: apply-addback
+excluded <- setdiff(candidates, c(all.vars(formula(m_prelim))[-1], "gcs"))
+key_terms <- tidy(m_prelim) %>% filter(term != "(Intercept)", p.value < 0.05) %>% pull(term)
+map_dfr(excluded, function(v) {
+  m_add <- update(m_prelim, as.formula(paste(". ~ . +", v)))
+  lrt <- anova(m_prelim, m_add, test = "LRT")
+  pct <- abs((coef(m_add)[key_terms] - coef(m_prelim)[key_terms]) / coef(m_prelim)[key_terms]) * 100
+  tibble(variable = v, lrt_p = round(lrt$`Pr(>Chi)`[2], 3),
+         max_change_pct = round(max(pct), 1))
+}) %>% arrange(lrt_p)
+```
+
+## Linearity in the logit and multicollinearity
+
+```{r}
+#| label: apply-linearity
+num_in_model <- intersect(num_vars, all.vars(formula(m_prelim)))
+
+# (a) empirical logits by quartile
+map_dfr(num_in_model, function(v) {
+  stroke %>% mutate(q = cut_number(.data[[v]], 4)) %>%
+    group_by(q) %>%
+    summarise(n = n(), died = sum(dead), .groups = "drop") %>%
+    mutate(variable = v, emp_logit = log((died + 0.5) / (n - died + 0.5)))
+}) %>% mutate(emp_logit = round(emp_logit, 3)) %>% select(variable, everything())
+
+# (b) LRT for an added quadratic term
+map_dfr(num_in_model, function(v) {
+  m_q <- update(m_prelim, as.formula(paste0(". ~ . + I(", v, "^2)")))
+  tibble(variable = v, quad_lrt_p = round(anova(m_prelim, m_q, test = "LRT")$`Pr(>Chi)`[2], 3))
+})
+```
+
+```{r}
+#| label: apply-linearity-plot
+#| fig-height: 4
+map_dfr(num_in_model, function(v) {
+  stroke %>% mutate(q = cut_number(.data[[v]], 4)) %>% group_by(q) %>%
+    summarise(mid = median(.data[[v]]), n = n(), died = sum(dead), .groups = "drop") %>%
+    mutate(variable = v, emp_logit = log((died + 0.5) / (n - died + 0.5)))
+}) %>%
+  ggplot(aes(mid, emp_logit)) + geom_point(size = 3) + geom_line() +
+  facet_wrap(~ variable, scales = "free_x") +
+  labs(x = "Quartile median", y = "Empirical logit", title = "Linearity in the logit")
+```
+
+```{r}
+#| label: apply-vif
+vif(m_prelim)
+```
+
+**Result.** For WBC, the empirical logits rise steadily across the quartiles. For age they are fairly flat and irregular, which fits its weak association with death. Neither quadratic term is significant (p > 0.05), so the **linear-in-the-logit assumption is reasonable** and both variables stay in as linear terms. All VIFs are close to 1, so there is no multicollinearity.
+
+## Final model
+
+```{r}
+#| label: apply-final
+m_final <- m_prelim
+summary(m_final)
+glance(m_final)
+anova(m_null, m_final, test = "LRT")   # overall model test
+```
+
+```{r}
+#| include: false
+g_lrt <- anova(m_null, m_final, test = "LRT")
+```
+
+**Final model:** `r deparse(formula(m_final))`. The model is highly significant overall: G = `r round(g_lrt$Deviance[2], 2)` on `r g_lrt$Df[2]` df, p `r format.pval(g_lrt$"Pr(>Chi)"[2], eps = 0.001)`.
+
+# Assess
+
+## Goodness of fit: Hosmer–Lemeshow test
+
+```{r}
+#| label: assess-hl
+hl <- map_dfr(c(10, 8, 6), function(g) {
+  h <- hoslem.test(stroke$dead, fitted(m_final), g = g)
+  tibble(groups = g, C_hat = round(unname(h$statistic), 3),
+         df = unname(h$parameter), p_value = round(h$p.value, 4))
+})
+hl
+
+h10 <- hoslem.test(stroke$dead, fitted(m_final), g = 10)
+cbind(h10$observed, round(h10$expected, 1))   # observed vs expected by decile
+```
+
+**Interpretation.** Hosmer–Lemeshow p = `r hl$p_value[1]` with 10 groups (`r hl$p_value[2]` with 8, `r hl$p_value[3]` with 6). `r if (all(hl$p_value > 0.05)) "None of these is significant, so there is no evidence of poor fit: observed and expected deaths agree across the deciles of risk." else "At least one grouping gives p < 0.05, so calibration may be imperfect in some risk groups. Without interaction terms (excluded by design), the main-effect model may not capture structure such as the stroke type by referral interaction described in the chapter."`
+
+## Diagnostic statistics (broom)
+
+`broom::augment()` gives the fitted probability, leverage (`.hat`) and Cook's distance. From these, the Hosmer–Lemeshow diagnostics are calculated:
+
+- standardised Pearson residual r~s~ = r / √(1 − h)
+- **Δχ² (dchisquare)** = r~s~²
+- **Δβ (dbeta)** = r~s~² · h / (1 − h)
+
+```{r}
+#| label: assess-diag
+p_par <- length(coef(m_final))          # parameters incl. intercept
+n     <- nrow(stroke)
+
+diag <- augment(m_final, type.predict = "response", type.residuals = "pearson") %>%
+  mutate(id          = stroke$id,
+         std_pearson = .resid / sqrt(1 - .hat),
+         dchisq      = std_pearson^2,
+         dbeta       = std_pearson^2 * .hat / (1 - .hat),
+         leverage    = .hat)
+
+cutoffs <- c(leverage = 2 * p_par / n, dchisq = 4, dbeta = 1, cooksd = 4 / n)
+round(cutoffs, 3)
+
+diag %>% select(.fitted, leverage, std_pearson, dchisq, dbeta, .cooksd) %>%
+  summary()
+```
+
+```{r}
+#| label: assess-diag-plots
+#| fig-height: 7
+diag_long <- diag %>%
+  select(id, .fitted, leverage, dchisq, dbeta) %>%
+  pivot_longer(c(leverage, dchisq, dbeta), names_to = "statistic") %>%
+  mutate(cut = cutoffs[statistic],
+         statistic = factor(statistic, c("leverage", "dchisq", "dbeta"),
+                            c("Leverage (h)", "Δχ² (dchisquare)", "Δβ (dbeta)")))
+
+ggplot(diag_long, aes(.fitted, value)) +
+  geom_point(alpha = 0.6) +
+  geom_hline(aes(yintercept = cut), linetype = "dashed", colour = "red") +
+  geom_text(data = ~ filter(.x, value > cut), aes(label = id),
+            size = 2.6, vjust = -0.6, check_overlap = TRUE) +
+  facet_wrap(~ statistic, scales = "free_y", ncol = 1) +
+  labs(x = "Fitted probability of death", y = NULL,
+       title = "Diagnostic statistics vs fitted probability (dashed = cut-off)")
+```
+
+```{r}
+#| label: assess-diag-bubble
+ggplot(diag, aes(.fitted, dchisq, size = dbeta, colour = factor(outcome))) +
+  geom_point(alpha = 0.6) +
+  geom_hline(yintercept = 4, linetype = "dashed") +
+  scale_colour_manual(values = c(alive = "#4C9F70", dead = "#C0504D"), name = "Outcome") +
+  labs(x = "Fitted probability", y = "Δχ²", size = "Δβ",
+       title = "Δχ² vs fitted probability, sized by Δβ")
+```
+
+**Interpretation.** The plots show the usual two arms. Points high on the left are patients who **died despite a low predicted risk**; points high on the right are patients who **survived despite a high predicted risk**. Points above the dashed lines are poorly fitted or influential.
+
+## Influential observations
+
+```{r}
+#| label: assess-influential
+influential <- diag %>%
+  mutate(high_leverage = leverage > cutoffs["leverage"],
+         high_dchisq   = dchisq   > cutoffs["dchisq"],
+         high_dbeta    = dbeta    > cutoffs["dbeta"],
+         high_cooks    = .cooksd  > cutoffs["cooksd"],
+         n_flags = high_leverage + high_dchisq + high_dbeta + high_cooks) %>%
+  filter(n_flags > 0) %>%
+  arrange(desc(dbeta))
+
+influential %>%
+  select(id, outcome, all_of(all.vars(formula(m_final))[-1]),
+         fitted = .fitted, leverage, dchisq, dbeta, cooksd = .cooksd, n_flags) %>%
+  mutate(across(where(is.double), ~ round(.x, 3))) %>%
+  print(n = Inf)
+
+tibble(criterion = c("Leverage > 2p/n", "Δχ² > 4", "Δβ > 1", "Cook's D > 4/n"),
+       n_flagged = c(sum(influential$high_leverage), sum(influential$high_dchisq),
+                     sum(influential$high_dbeta), sum(influential$high_cooks)))
+```
+
+### Sensitivity analysis
+
+The most influential patients are removed in a **sensitivity analysis only**: those flagged by Δβ > 1, or else the 5 with the largest Δβ. The odds ratios are then compared. **The main model keeps all patients.**
+
+```{r}
+#| label: assess-sensitivity
+drop_ids <- if (any(diag$dbeta > 1)) diag$id[diag$dbeta > 1] else
+  diag %>% slice_max(dbeta, n = 5) %>% pull(id)
+drop_ids
+
+m_sens <- update(m_final, data = filter(stroke, !id %in% drop_ids))
+
+full_join(
+  tidy(m_final, exponentiate = TRUE, conf.int = TRUE) %>%
+    transmute(term, OR_all = estimate, CI_all = sprintf("%.2f–%.2f", conf.low, conf.high)),
+  tidy(m_sens, exponentiate = TRUE, conf.int = TRUE) %>%
+    transmute(term, OR_sens = estimate, CI_sens = sprintf("%.2f–%.2f", conf.low, conf.high)),
+  by = "term") %>%
+  filter(term != "(Intercept)") %>%
+  mutate(pct_change = round(100 * (OR_sens - OR_all) / OR_all, 1),
+         across(c(OR_all, OR_sens), ~ round(.x, 3)))
+```
+
+**Interpretation.** Without the `r length(drop_ids)` most influential patients, the ORs for WBC, stroke type and referral change by less than about 10% and keep the same direction and significance. **The main conclusions do not depend on a few patients.** The sex OR moves more, but it is non-significant in both fits and its CI includes 1. Influential patients should be checked against the source records, not deleted.
+
+## Discrimination: ROC curve and AUC
+
+```{r}
+#| label: assess-roc
+roc_final <- roc(stroke$dead, fitted(m_final), quiet = TRUE)
+auc_ci <- ci.auc(roc_final)
+auc_ci
+
+ggroc(roc_final, legacy.axes = TRUE, colour = "steelblue", linewidth = 1) +
+  geom_abline(linetype = "dashed", colour = "grey50") +
+  annotate("text", x = 0.65, y = 0.2, size = 5,
+           label = sprintf("AUC = %.3f (95%% CI %.3f–%.3f)", auc_ci[2], auc_ci[1], auc_ci[3])) +
+  labs(title = "ROC curve: final model", x = "1 − Specificity", y = "Sensitivity")
+```
+
+**Interpretation.** AUC = `r round(auc_ci[2], 3)`. A randomly chosen patient who died has a `r round(100*auc_ci[2])`% chance of a higher predicted risk than a randomly chosen survivor. `r if (auc_ci[2] >= 0.8) "This is excellent discrimination" else if (auc_ci[2] >= 0.7) "This is acceptable discrimination" else "This is poor discrimination"` by Hosmer–Lemeshow's guide (0.7–0.8 acceptable, 0.8–0.9 excellent). It is not higher because the strongest predictor, GCS, was left out on purpose.
+
+## Accuracy: classification tables
+
+```{r}
+#| label: assess-accuracy
+youden <- coords(roc_final, "best", best.method = "youden",
+                 ret = c("threshold", "sensitivity", "specificity"))
+
+classify <- function(cut) {
+  pred <- factor(if_else(fitted(m_final) >= cut, "dead", "alive"), c("alive", "dead"))
+  tab  <- table(Predicted = pred, Observed = stroke$outcome)
+  TP <- tab["dead", "dead"]; TN <- tab["alive", "alive"]
+  FP <- tab["dead", "alive"]; FN <- tab["alive", "dead"]
+  list(table = tab,
+       metrics = tibble(cut_off = round(cut, 3),
+                        accuracy = (TP + TN) / sum(tab),
+                        sensitivity = TP / (TP + FN), specificity = TN / (TN + FP),
+                        PPV = TP / (TP + FP), NPV = TN / (TN + FN)))
+}
+c05 <- classify(0.5)
+cyj <- classify(youden$threshold[1])
+
+c05$table
+cyj$table
+acc_tbl <- bind_rows(`0.5` = c05$metrics, Youden = cyj$metrics, .id = "rule") %>%
+  mutate(across(accuracy:NPV, ~ round(.x, 3)))
+acc_tbl
+```
+
+**Interpretation.** At the 0.5 cut-off the accuracy is `r round(100*acc_tbl$accuracy[1],1)`%, but the sensitivity is only `r round(100*acc_tbl$sensitivity[1],1)`%. Deaths are the minority (27%), so few patients reach a predicted risk of 0.5. The Youden cut-off (`r acc_tbl$cut_off[2]`) trades some specificity for higher sensitivity (`r round(100*acc_tbl$sensitivity[2],1)`%), with an accuracy of `r round(100*acc_tbl$accuracy[2],1)`%. Accuracy alone is misleading when the outcome is unbalanced, so read it together with sensitivity, specificity and AUC.
+
+# Present
+
+## Univariable logistic regression: log-odds and odds ratios
+
+```{r}
+#| label: tbl-univariable
+#| tbl-cap: "Table 2. Univariable (simple) logistic regression: β (log-odds) and crude OR with 95% CI"
+uni_data <- stroke %>% select(outcome, all_of(candidates))
+uni_beta <- tbl_uvregression(uni_data, method = glm, y = outcome,
+                             method.args = list(family = binomial),
+                             exponentiate = FALSE, label = var_labels,
+                             hide_n = TRUE) %>%
+  modify_column_hide(p.value)
+uni_or <- tbl_uvregression(uni_data, method = glm, y = outcome,
+                           method.args = list(family = binomial),
+                           exponentiate = TRUE, label = var_labels) %>%
+  add_global_p() %>% bold_p(t = 0.25)
+tbl_merge(list(uni_beta, uni_or),
+          tab_spanner = c("**Log-odds (β)**", "**Crude odds ratio**")) %>%
+  modify_footnote_header("p-value: likelihood ratio test; bold = p < 0.25 (screening threshold)",
+                         columns = p.value_2, replace = TRUE)
+```
+
+## Multivariable logistic regression: log-odds and adjusted odds ratios
+
+```{r}
+#| label: tbl-multivariable
+#| tbl-cap: "Table 3. Multivariable logistic regression (final model, no interaction): β (log-odds) and adjusted OR with 95% CI"
+mv_beta <- tbl_regression(m_final, exponentiate = FALSE, label = var_labels,
+                          intercept = TRUE) %>%
+  modify_column_hide(p.value)
+mv_or <- tbl_regression(m_final, exponentiate = TRUE, label = var_labels,
+                        intercept = TRUE) %>%
+  add_global_p(keep = TRUE) %>% bold_p()
+tbl_merge(list(mv_beta, mv_or),
+          tab_spanner = c("**Log-odds (β)**", "**Adjusted odds ratio**"))
+```
+
+```{r}
+#| label: tbl-multivariable-broom
+#| tbl-cap: "Table 3b. Final model from broom::tidy() with LRT for removing each term"
+lrt_terms <- drop1(m_final, test = "LRT") %>% as.data.frame() %>%
+  rownames_to_column("variable") %>% filter(variable != "<none>") %>%
+  select(variable, LRT_chisq = LRT, LRT_p = `Pr(>Chi)`)
+tidy(m_final, conf.int = TRUE) %>%
+  transmute(term,
+            `β (95% CI)`  = sprintf("%.3f (%.3f, %.3f)", estimate, conf.low, conf.high),
+            SE = round(std.error, 3),
+            `OR (95% CI)` = if_else(term == "(Intercept)", "—",
+                                    sprintf("%.3f (%.3f, %.3f)", exp(estimate),
+                                            exp(conf.low), exp(conf.high))),
+            `Wald p` = format.pval(p.value, digits = 3, eps = 0.001)) %>%
+  knitr::kable()
+lrt_terms %>% mutate(across(where(is.numeric), ~ signif(.x, 3))) %>% knitr::kable()
+```
+
+## Crude vs adjusted
+
+```{r}
+#| label: tbl-crude-adjusted
+#| tbl-cap: "Table 4. Crude and adjusted odds ratios for the variables in the final model"
+final_vars <- all.vars(formula(m_final))[-1]
+crude_tbl <- stroke %>% select(outcome, all_of(final_vars)) %>%
+  tbl_uvregression(method = glm, y = outcome,
+                   method.args = list(family = binomial),
+                   exponentiate = TRUE, label = var_labels, hide_n = TRUE)
+adj_tbl <- tbl_regression(m_final, exponentiate = TRUE, label = var_labels)
+tbl_merge(list(crude_tbl, adj_tbl), tab_spanner = c("**Crude OR**", "**Adjusted OR**"))
+```
+
+## Model fit and performance
+
+```{r}
+#| label: tbl-performance
+#| tbl-cap: "Table 5. Goodness of fit, discrimination and classification of the final model"
+tribble(
+  ~Measure, ~Value,
+  "Deviance (df)", sprintf("%.2f (%d)", deviance(m_final), df.residual(m_final)),
+  "AIC", sprintf("%.2f", AIC(m_final)),
+  "Model LRT vs null", sprintf("G = %.2f, df = %d, p %s", g_lrt$Deviance[2], g_lrt$Df[2],
+                               format.pval(g_lrt$`Pr(>Chi)`[2], eps = 0.001)),
+  "Hosmer–Lemeshow, g = 10", sprintf("Ĉ = %.3f, df = %d, p = %.4f", hl$C_hat[1], hl$df[1], hl$p_value[1]),
+  "Hosmer–Lemeshow, g = 8",  sprintf("Ĉ = %.3f, df = %d, p = %.4f", hl$C_hat[2], hl$df[2], hl$p_value[2]),
+  "Hosmer–Lemeshow, g = 6",  sprintf("Ĉ = %.3f, df = %d, p = %.4f", hl$C_hat[3], hl$df[3], hl$p_value[3]),
+  "AUC (95% CI)", sprintf("%.3f (%.3f–%.3f)", auc_ci[2], auc_ci[1], auc_ci[3]),
+  "Accuracy / Sens / Spec at 0.5",
+    sprintf("%.1f%% / %.1f%% / %.1f%%", 100*acc_tbl$accuracy[1], 100*acc_tbl$sensitivity[1], 100*acc_tbl$specificity[1]),
+  sprintf("Accuracy / Sens / Spec at Youden (%.3f)", acc_tbl$cut_off[2]),
+    sprintf("%.1f%% / %.1f%% / %.1f%%", 100*acc_tbl$accuracy[2], 100*acc_tbl$sensitivity[2], 100*acc_tbl$specificity[2]),
+  "Influential observations (Δβ > 1)", as.character(sum(diag$dbeta > 1))
+) %>% knitr::kable()
+```
+
+## Interpretation of the final model
+
+```{r}
+#| include: false
+or_tab <- tidy(m_final, exponentiate = TRUE, conf.int = TRUE)
+fmt_or <- function(pattern) {
+  r <- filter(or_tab, str_detect(term, pattern))
+  p_txt <- if (r$p.value < 0.001) "p < 0.001" else sprintf("p = %.3f", r$p.value)
+  sprintf("%.2f (95%% CI %.2f, %.2f; %s)", r$estimate, r$conf.low, r$conf.high, p_txt)
+}
+```
+
+Each adjusted odds ratio holds the other variables in the model constant:
+
+- **White cell count:** each 1 × 10⁹/L increase is associated with an adjusted OR of `r fmt_or("^wbc$")` for death.
+- **Stroke type:** haemorrhagic stroke has adjusted OR `r fmt_or("stroke_type")` compared with ischaemic stroke.
+- **Referral source:** GP/Home referral has adjusted OR `r fmt_or("referral")` compared with referral from another hospital. Hospital transfers are likely to be more severe cases.
+- **Sex:** female vs male adjusted OR `r fmt_or("sex")`.
+- **Age:** per year, adjusted OR `r fmt_or("^age$")`.
+
+# Publish
+
+This report was produced from `stroke_rreaapp.qmd` and rendered with Quarto to a self-contained HTML file (`reports/stroke_rreaapp.html`). The raw data file (`data/stroke-fatality-cooked2.dta`) was not changed. Every record was kept in the main analysis. The workflow and its decisions are documented in `implementation.md`, and the working rules in `AGENTS.md`.
+
+**Limitations.**
+
+- Teaching dataset with values modified by the author.
+- Single centre, n = 226.
+- GCS was deliberately left out, so the model is for estimating associations, not for prediction.
+- No interaction terms were considered (by design). The chapter shows a stroke type × referral interaction that this main-effect model does not include.
+
+```{r}
+#| label: session-info
+sessionInfo()
+```

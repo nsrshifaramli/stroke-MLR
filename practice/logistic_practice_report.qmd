@@ -1,0 +1,352 @@
+---
+title: "Logistic Regression Practice: Stroke Fatality at Discharge"
+subtitle: "Following *Logistic Regression Analysis in Health and Medicine* (Kamarul Imran Musa)"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    code-fold: show
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+# Setup
+
+The data are in `stroke-fatality-cooked2.dta`, a teaching dataset of 226 acute stroke admissions. The outcome is status at discharge (1 = dead, 0 = alive). The author changed a few values on purpose to make the teaching patterns clear, so treat the results as illustrations of method, not as evidence about stroke care.
+
+```{r}
+library(haven)
+library(tidyverse)
+library(broom)
+library(gtsummary)
+library(mgcv)
+library(ResourceSelection)
+library(pROC)
+
+stroke <- read_dta("../data/stroke-fatality-cooked2.dta") %>%
+  mutate(across(where(is.labelled), as_factor)) %>%
+  mutate(
+    stroketype   = fct_recode(stroketype,
+                              Ischaemic    = "CI (Ischaemic Stroke)",
+                              Haemorrhagic = "Haemorrhagic Stroke"),
+    referralcase = fct_recode(referralcase, Hospital = "hospital",
+                              `GP/Home` = "GP/Home/Missing"),
+    sex          = fct_relevel(sex, "male"),
+    outcome_num  = if_else(outcome == "dead", 1, 0)
+  )
+```
+
+# Describe the data
+
+```{r}
+count(stroke, outcome) %>% mutate(pct = round(n / sum(n) * 100, 1))
+```
+
+```{r}
+stroke %>%
+  select(-rn, -outcome_num) %>%
+  tbl_summary(by = outcome) %>%
+  add_overall() %>%
+  add_p()
+```
+
+**Interpretation.** `r sum(stroke$outcome_num)` of `r nrow(stroke)` patients (`r round(mean(stroke$outcome_num)*100, 1)`%) died before discharge. No values are missing.
+
+# Simple logistic regression
+
+## One predictor: GCS
+
+```{r}
+slr_null <- glm(outcome ~ 1,   data = stroke, family = binomial)
+slr_gcs  <- glm(outcome ~ gcs, data = stroke, family = binomial)
+tidy(slr_gcs, exponentiate = TRUE, conf.int = TRUE)
+anova(slr_null, slr_gcs, test = "LRT")
+```
+
+```{r}
+#| echo: false
+or_gcs <- exp(coef(slr_gcs)["gcs"])
+```
+
+**Interpretation.** Each one-point increase in GCS multiplies the odds of death by `r round(or_gcs, 3)`, which is about a `r round((1 - or_gcs) * 100)`% reduction in the odds. The likelihood ratio test shows GCS is a strong predictor.
+
+## Screening all candidate predictors
+
+```{r}
+stroke %>%
+  select(-rn, -outcome_num) %>%
+  tbl_uvregression(method = glm, y = outcome,
+                   method.args = list(family = binomial),
+                   exponentiate = TRUE) %>%
+  add_global_p() %>%
+  bold_p(t = 0.25)
+```
+
+**Interpretation.** Purposeful selection (Hosmer and colleagues) carries forward any variable with univariable p < 0.25, shown in bold. The table gives crude odds ratios only. Which variables enter the multiple model is still decided on causal grounds.
+
+# Residuals of the simple model
+
+```{r}
+#| layout-ncol: 2
+aug_gcs <- augment(slr_gcs, type.predict = "response") %>%
+  mutate(raw_resid   = stroke$outcome_num - .fitted,
+         std_pearson = rstandard(slr_gcs, type = "pearson"))
+
+ggplot(aug_gcs, aes(.fitted, raw_resid)) + geom_point(alpha = 0.6) +
+  labs(x = "Fitted probability", y = "Raw residual", title = "Raw vs fitted")
+
+ggplot(aug_gcs, aes(gcs, std_pearson)) + geom_jitter(width = 0.2, alpha = 0.6) +
+  geom_hline(yintercept = c(-2, 2), linetype = "dashed") +
+  labs(x = "GCS", y = "Standardised Pearson residual", title = "Residual vs predictor")
+```
+
+**Interpretation.** A binary outcome always gives two bands of raw residuals, and the bands tell you nothing on their own. The useful plot is residuals against the predictor. `r sum(abs(aug_gcs$std_pearson) > 2)` observations have |standardised Pearson residual| > 2.
+
+# Multiple logistic regression: main-effect model
+
+GCS is **left out on purpose**. It is a *mediator*, not a confounder: stroke subtype → depressed consciousness (GCS) → death. Adjusting for GCS would block the pathway through which stroke type acts, which would bias the stroke-type effect towards the null.
+
+```{r}
+mlr_main <- glm(outcome ~ stroketype + wbc + referralcase + sex,
+                data = stroke, family = binomial)
+tidy(mlr_main, exponentiate = TRUE, conf.int = TRUE)
+drop1(mlr_main, test = "LRT")
+anova(slr_null, mlr_main, test = "LRT")
+```
+
+## Crude vs adjusted
+
+```{r}
+crude <- stroke %>%
+  select(outcome, stroketype, wbc, referralcase, sex) %>%
+  tbl_uvregression(method = glm, y = outcome,
+                   method.args = list(family = binomial), exponentiate = TRUE)
+adj <- tbl_regression(mlr_main, exponentiate = TRUE)
+tbl_merge(list(crude, adj), tab_spanner = c("**Crude OR**", "**Adjusted OR**"))
+```
+
+```{r}
+#| echo: false
+orm <- exp(coef(mlr_main))
+```
+
+**Interpretation.** Holding the other covariates constant:
+
+- Haemorrhagic stroke: adjusted OR `r round(orm[2], 2)` compared with ischaemic stroke.
+- Each 1 × 10⁹/L increase in white cell count: adjusted OR `r round(orm[3], 3)`, about `r round((orm[3]-1)*100)`% higher odds of death.
+- GP/Home referral: adjusted OR `r round(orm[4], 2)` compared with hospital referral.
+- Female vs male: adjusted OR `r round(orm[5], 2)`, not significant. Sex is kept as a standard demographic adjustment.
+
+# Linearity in the logit for white cell count
+
+```{r}
+stroke %>%
+  mutate(wbc_q = cut_number(wbc, 4)) %>%
+  group_by(wbc_q) %>%
+  summarise(n = n(), died = sum(outcome_num),
+            prop = round(died / n, 3),
+            emp_logit = round(log(prop / (1 - prop)), 3))
+```
+
+```{r}
+mlr_quad <- update(mlr_main, . ~ . + I(wbc^2))
+anova(mlr_main, mlr_quad, test = "LRT")
+mlr_log <- glm(outcome ~ stroketype + log(wbc) + referralcase + sex,
+               data = stroke, family = binomial)
+AIC(mlr_main, mlr_log)
+```
+
+```{r}
+gam_wbc <- gam(outcome_num ~ stroketype + s(wbc) + referralcase + sex,
+               data = stroke, family = binomial, method = "REML")
+summary(gam_wbc)$s.table
+plot(gam_wbc, shade = TRUE, rug = TRUE, xlab = "White cell count",
+     ylab = "Smooth effect (logit scale)")
+```
+
+**Interpretation.** Empirical logits rise steadily across the quartiles, the quadratic term adds nothing, and the log transformation barely changes the AIC. The GAM smooth has edf ≈ `r round(summary(gam_wbc)$s.table[1, "edf"], 2)`, close to 1, which means close to a straight line. **A linear term for WBC is adequate.**
+
+# Interaction
+
+## Screening two-way interactions
+
+```{r}
+pairs <- c("stroketype:referralcase", "stroketype:wbc", "referralcase:sex",
+           "stroketype:sex", "wbc:sex", "wbc:referralcase")
+map_dfr(pairs, function(term) {
+  m   <- update(mlr_main, as.formula(paste(". ~ . +", term)))
+  lrt <- anova(mlr_main, m, test = "LRT")
+  tibble(interaction = term, LRT_chisq = round(lrt$Deviance[2], 3),
+         p = round(lrt$`Pr(>Chi)`[2], 3), AIC = round(AIC(m), 1))
+}) %>% arrange(p)
+```
+
+**Interpretation.** Only **stroke type × referral source** is significant (p ≈ 0.006), and it lowers the AIC from `r round(AIC(mlr_main), 1)`. It is kept, which gives the final model.
+
+## Final model
+
+```{r}
+mlr_final <- glm(outcome ~ stroketype * referralcase + wbc + sex,
+                 data = stroke, family = binomial)
+tidy(mlr_final, exponentiate = TRUE, conf.int = TRUE)
+anova(mlr_main, mlr_final, test = "LRT")
+```
+
+Once the model has a product term, the `stroketypeHaemorrhagic` coefficient is the stroke-type effect **among hospital-referred patients only**, not a general effect. To get the effect in each subgroup, add coefficients and use the covariance matrix:
+
+```{r}
+b <- coef(mlr_final); V <- vcov(mlr_final)
+haem <- "stroketypeHaemorrhagic"; gp <- "referralcaseGP/Home"
+int  <- "stroketypeHaemorrhagic:referralcaseGP/Home"
+strat_or <- function(terms) {
+  est <- sum(b[terms]); se <- sqrt(sum(V[terms, terms]))
+  exp(c(OR = est, lower = est - 1.96 * se, upper = est + 1.96 * se))
+}
+strata <- tribble(
+  ~Effect, ~terms,
+  "Haemorrhagic vs ischaemic, hospital-referred", haem,
+  "Haemorrhagic vs ischaemic, GP/Home-referred",  c(haem, int),
+  "GP/Home vs hospital, ischaemic stroke",        gp,
+  "GP/Home vs hospital, haemorrhagic stroke",     c(gp, int)
+) %>%
+  mutate(res = map(terms, strat_or),
+         OR = map_dbl(res, "OR"), lower = map_dbl(res, "lower"),
+         upper = map_dbl(res, "upper")) %>%
+  select(Effect, OR, lower, upper) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2)))
+strata
+```
+
+**Interpretation.** The effect of stroke subtype depends on how the patient reached hospital:
+
+- Among patients **transferred from another hospital**, haemorrhagic stroke has OR `r strata$OR[1]` (`r strata$lower[1]`, `r strata$upper[1]`), which is essentially no difference.
+- Among **GP/Home-referred** patients, haemorrhagic stroke has OR `r strata$OR[2]` (`r strata$lower[2]`, `r strata$upper[2]`).
+
+The likely explanation is clinical. Transfer from another hospital is itself a marker of severity, so it narrows the gap between the two stroke types.
+
+## Second example: continuous × categorical (GCS × sex)
+
+This is an illustration only. GCS stays out of the estimation model.
+
+```{r}
+m_gcs <- glm(outcome ~ gcs * sex + wbc, data = stroke, family = binomial)
+m_gcs_noint <- update(m_gcs, . ~ . - gcs:sex)
+anova(m_gcs_noint, m_gcs, test = "LRT")
+
+bg <- coef(m_gcs)
+c(OR_per_GCS_male   = exp(bg["gcs"]),
+  OR_per_GCS_female = exp(bg["gcs"] + bg["gcs:sexfemale"]))
+
+cbind(Wald = exp(confint.default(m_gcs)["gcs", ]),
+      Profile = exp(confint(m_gcs)["gcs", ]))   # CI for the male slope
+
+with(stroke, table(sex, GCS = cut(gcs, c(2, 8, 12, 15),
+                                  labels = c("3-8", "9-12", "13-15")), outcome))
+```
+
+**Interpretation.** The GCS slope is much steeper in men than in women. In men, GCS almost perfectly separates deaths from survivors (**near-separation**), so the Wald CI is unreliable and the **profile-likelihood CI** should be used. The LRT for the interaction itself does not depend on the normal approximation, so it is still valid.
+
+# Assessing the final model
+
+## Goodness of fit: Hosmer–Lemeshow
+
+```{r}
+hl <- function(model, g) {
+  h <- hoslem.test(stroke$outcome_num, fitted(model), g = g)
+  c(g = g, C_hat = unname(round(h$statistic, 3)), p = round(h$p.value, 4))
+}
+rbind(
+  `Main effect, g=10` = hl(mlr_main, 10),
+  `Final, g=10`       = hl(mlr_final, 10),
+  `Final, g=8`        = hl(mlr_final, 8),
+  `Final, g=6`        = hl(mlr_final, 6)
+)
+```
+
+**Interpretation.** The main-effect model fits poorly (p < 0.05). Once the interaction is added the fit is good, and it stays good for every grouping. The missing interaction caused the misfit. Always report the number of groups, because the result depends on it.
+
+## Discrimination: ROC curve
+
+```{r}
+roc_main  <- roc(stroke$outcome_num, fitted(mlr_main),  quiet = TRUE)
+roc_final <- roc(stroke$outcome_num, fitted(mlr_final), quiet = TRUE)
+tibble(model = c("Main effect", "Final"),
+       AUC = c(auc(roc_main), auc(roc_final)),
+       lower = c(ci.auc(roc_main)[1], ci.auc(roc_final)[1]),
+       upper = c(ci.auc(roc_main)[3], ci.auc(roc_final)[3]),
+       Tjur_R2 = map_dbl(list(mlr_main, mlr_final), function(m)
+         mean(fitted(m)[stroke$outcome_num == 1]) -
+         mean(fitted(m)[stroke$outcome_num == 0]))) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+plot(roc_final, print.auc = TRUE, legacy.axes = TRUE)
+```
+
+**Interpretation.** An AUC of about 0.81 means good discrimination. It is not higher because GCS, the strongest predictor, was left out on purpose: this model was built to estimate associations, not to predict.
+
+## Diagnostics
+
+```{r}
+diag_final <- augment(mlr_final, type.predict = "response") %>%
+  mutate(rn = stroke$rn,
+         delta_chisq = rstandard(mlr_final, type = "pearson")^2)
+
+ggplot(diag_final, aes(.fitted, delta_chisq, size = .cooksd)) +
+  geom_point(alpha = 0.5) +
+  labs(x = "Fitted probability", y = expression(Delta * chi^2),
+       size = "Cook's D")
+
+diag_final %>% arrange(desc(.cooksd)) %>%
+  select(rn, outcome, stroketype, referralcase, sex, wbc, .fitted, .cooksd) %>%
+  head(5)
+```
+
+**Interpretation.** The two arms are patients whose outcome went against their prediction: deaths with low predicted risk, and survivors with high predicted risk. Look at influential patients and report them, but **do not delete them** just to improve the fit.
+
+# Presentation and prediction
+
+```{r}
+tbl_regression(mlr_final, exponentiate = TRUE)
+```
+
+```{r}
+newdat <- expand_grid(wbc = seq(4, 27, by = 0.5),
+                      stroketype = levels(stroke$stroketype),
+                      referralcase = levels(stroke$referralcase),
+                      sex = "male")
+pred <- predict(mlr_final, newdata = newdat, type = "link", se.fit = TRUE)
+newdat <- newdat %>%
+  mutate(prob  = plogis(pred$fit),
+         lower = plogis(pred$fit - 1.96 * pred$se.fit),
+         upper = plogis(pred$fit + 1.96 * pred$se.fit))
+
+ggplot(newdat, aes(wbc, prob, colour = stroketype, fill = stroketype)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2, colour = NA) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~ referralcase) +
+  labs(x = "White cell count (× 10⁹/L)", y = "Predicted probability of death",
+       colour = "Stroke type", fill = "Stroke type",
+       title = "Predicted risk for male patients") +
+  theme_minimal()
+```
+
+```{r}
+predict(mlr_final, type = "response",
+        newdata = data.frame(stroketype = "Haemorrhagic", referralcase = "GP/Home",
+                             wbc = 15, sex = "female"))
+```
+
+**Reporting in words.** Each 1 × 10⁹/L increase in admission white cell count was associated with higher adjusted odds of death (OR `r round(exp(coef(mlr_final)["wbc"]), 3)`). There was no evidence of a difference between men and women. The effect of stroke subtype depended on referral source (interaction p ≈ 0.006). Among hospital-referred patients, haemorrhagic stroke had OR `r strata$OR[1]` compared with ischaemic stroke. Among GP/Home-referred patients the OR was `r strata$OR[2]` (`r strata$lower[2]`, `r strata$upper[2]`).
+
+# Key lessons
+
+1. Report the coefficient as a log odds ratio and exponentiate it to get the OR.
+2. Plot residuals against the predictor, not against the fitted values.
+3. Choosing covariates is a causal question: GCS is a mediator, so it stays out.
+4. Once a model has an interaction, report the OR for each subgroup.
+5. A poor goodness-of-fit result often means an interaction is missing.
+6. Under near-separation, use profile-likelihood confidence intervals.
+7. Never change or delete data to make a model look better.
