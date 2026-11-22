@@ -30,6 +30,7 @@ Based on *Logistic Regression Analysis in Health and Medicine* by Kamarul Imran 
 ```
 ├── AGENTS.md            # rules for anyone or any AI agent working on the project
 ├── implementation.md    # the RREAAPP analysis plan and decisions
+├── summary.md           # one-page summary of methods and results
 ├── data/                # put stroke-fatality-cooked2.dta here (not included)
 ├── analysis/
 │   └── stroke_rreaapp.qmd   # main analysis (Quarto)
